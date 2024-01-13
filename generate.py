@@ -149,7 +149,7 @@ def main(
     interactive: bool = False,
     num_samples: int = 5,
     max_new_tokens: int = 100,
-    top_k: int = 200,
+    top_k: int = 20,
     temperature: float = 0.8,
     checkpoint_path: Path = Path("."),
     compile: bool = True,
@@ -163,7 +163,7 @@ def main(
 
     print(f"Using device={device}")
     precision = torch.float16
-    is_chat = "chat" in str(checkpoint_path)
+    is_chat = "chat" in str(checkpoint_path).lower()
 
     print("Loading model ...")
     t0 = time.time()
@@ -249,7 +249,7 @@ if __name__ == '__main__':
     parser.add_argument('--interactive', action='store_true', help='Whether to launch in interactive mode')
     parser.add_argument('--num_samples', type=int, default=5, help='Number of samples.')
     parser.add_argument('--max_new_tokens', type=int, default=200, help='Maximum number of new tokens.')
-    parser.add_argument('--top_k', type=int, default=200, help='Top-k for sampling.')
+    parser.add_argument('--top_k', type=int, default=20, help='Top-k for sampling.')
     parser.add_argument('--temperature', type=float, default=0.8, help='Temperature for sampling.')
     parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints"), help='Model checkpoint path.')
     parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')

@@ -82,8 +82,6 @@ class Transformer(nn.Module):
         if prefix + 'token_embd.weight' in state_dict:
              dtype = int(state_dict[prefix + 'token_embd.weight_type'])
              if dtype >= 2:
-                 #weight = torch.empty((self.config.vocab_size, self.config.dim), dtype=torch.half, device="cuda")
-                 #llamacpp_cuda.ggml_dequantize(state_dict[prefix + 'token_embd.weight'].cuda(), weight, dtype)
                  weight = torch.ops.llama_cpp.ggml_dequantize(state_dict[prefix + 'token_embd.weight'].cuda(), dtype, self.config.vocab_size, self.config.dim)
                  state_dict[prefix + 'token_embd.weight'] = weight.cpu()
              del state_dict[prefix + 'token_embd.weight_type']
@@ -222,12 +220,8 @@ class Linear(nn.Module):
         if self.weight_type_int < 2:
             output = x @ self.weight.T
         elif xshape.shape[0] == 1:
-            # output = torch.empty((1, self.outfeatures), dtype=torch.half, device=x.device)
-            #llamacpp_cuda.ggml_mul_mat_vec(self.weight, xshape, output, self.weight_type)
             output = torch.ops.llama_cpp.ggml_mul_mat_vec(self.weight, xshape, self.weight_type_int, self.outfeatures)
         else:
-            #weight = torch.zeros((self.outfeatures, self.infeatures), dtype=torch.half, device=x.device)
-            #llamacpp_cuda.ggml_dequantize(self.weight, weight, self.weight_type)
             weight = torch.ops.llama_cpp.ggml_dequantize(self.weight, self.weight_type_int, self.outfeatures, self.infeatures)
             output = x @ weight.T
         if self.bias is not None:

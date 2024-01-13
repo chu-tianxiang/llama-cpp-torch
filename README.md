@@ -28,6 +28,9 @@ python gguf_reader.py --input tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --output Tiny
 python generate.py --checkpoint_path TinyLlama-Q4_K_M --interactive --compile
 ```
 
+`torch.compile` will take minutes, you can also run in eager mode without `--compile` flag.
+
+
 ## Todo
 * Add support to more model
 * Add support to new 2-bit quant.

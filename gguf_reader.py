@@ -330,7 +330,7 @@ def convert_to_state_dict(checkpoint, save_dir):
     n_head = int(result.fields['llama.attention.head_count'].parts[-1])
     n_local_heads = int(result.fields['llama.attention.head_count_kv'].parts[-1])
     intermediate_size = int(result.fields['llama.feed_forward_length'].parts[-1])
-    rope_base = float(result.fields['llama.rope.freq_base'].parts[-1])
+    rope_base = float(result.fields['llama.rope.freq_base'].parts[-1]) if 'llama.rope.freq_base' in result.fields else 10000
     norm_eps = float(result.fields['llama.attention.layer_norm_rms_epsilon'].parts[-1])
     dim = int(result.fields['llama.embedding_length'].parts[-1])
     model_config= {
