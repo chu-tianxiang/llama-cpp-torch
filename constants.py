@@ -452,6 +452,8 @@ class GGMLQuantizationType(IntEnum):
     Q5_K = 13
     Q6_K = 14
     Q8_K = 15
+    IQ2_XXS = 16
+    IQ2_XS = 17
 
 
 class GGUFEndian(IntEnum):
@@ -510,6 +512,8 @@ GGML_QUANT_SIZES = {
     GGMLQuantizationType.Q5_K: (256, 2 + 2 + QK_K // 2 + QK_K // 8 + 12),
     GGMLQuantizationType.Q6_K: (256, 2 + QK_K // 2 + QK_K // 4 + QK_K // 16),
     GGMLQuantizationType.Q8_K: (256, 4 + QK_K + QK_K // 8),
+    GGMLQuantizationType.IQ2_XXS: (256, 2 + QK_K // 4),
+    GGMLQuantizationType.IQ2_XS: (256, 2 + QK_K // 4 + QK_K // 32),
 }
 
 
