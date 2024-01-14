@@ -81,9 +81,15 @@ def apply_tp(model: Transformer) -> None:
     world_size = _get_world_size()
     _apply_tp_Transformer(model)
     for block in model.blk:
-        _apply_tp_linear(block.ffn_gate, "colwise")
-        _apply_tp_linear(block.ffn_up, "colwise")
-        _apply_tp_linear(block.ffn_down, "rowwise")
+        if isinstance(block.ffn_gate, nn.ModuleList):
+            for i in range(len(block.ffn_gate)):
+                _apply_tp_linear(block.ffn_gate[i], "colwise")
+                _apply_tp_linear(block.ffn_up[i], "colwise")
+                _apply_tp_linear(block.ffn_down[i], "rowwise")
+        else:
+            _apply_tp_linear(block.ffn_gate, "colwise")
+            _apply_tp_linear(block.ffn_up, "colwise")
+            _apply_tp_linear(block.ffn_down, "rowwise")
         _apply_tp_linear(block.attn_q, "colwise")
         _apply_tp_linear(block.attn_k, "colwise")
         _apply_tp_linear(block.attn_v, "colwise")
