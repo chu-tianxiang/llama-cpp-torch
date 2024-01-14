@@ -34,6 +34,9 @@ class ModelArgs:
     head_dim: int = 64
     rope_base: float = 10000
     norm_eps: float = 1e-5
+    moe: bool = False
+    num_experts: int = 1
+    num_experts_per_tok: int = 1
 
     def __post_init__(self):
         if self.n_local_heads == -1:
@@ -143,14 +146,23 @@ class TransformerBlock(nn.Module):
         self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
 
         # ffn layer
-        self.ffn_gate = Linear(config.dim, config.intermediate_size, bias=False)
-        self.ffn_up = Linear(config.dim, config.intermediate_size, bias=False)
-        self.ffn_down = Linear(config.intermediate_size, config.dim, bias=False)
+        if config.moe:
+            self.ffn_gate_inp = Linear(config.dim, config.num_experts, bias=False)
+            self.ffn_gate = nn.ModuleList(Linear(config.dim, config.intermediate_size, bias=False) for _ in range(config.num_experts))
+            self.ffn_up = nn.ModuleList(Linear(config.dim, config.intermediate_size, bias=False) for _ in range(config.num_experts))
+            self.ffn_down = nn.ModuleList(Linear(config.intermediate_size, config.dim, bias=False) for _ in range(config.num_experts))
+        else:
+            self.ffn_gate = Linear(config.dim, config.intermediate_size, bias=False)
+            self.ffn_up = Linear(config.dim, config.intermediate_size, bias=False)
+            self.ffn_down = Linear(config.intermediate_size, config.dim, bias=False)
 
         self.n_head = config.n_head
         self.head_dim = config.head_dim
         self.n_local_heads = config.n_local_heads
         self.dim = config.dim
+        self.moe = config.moe
+        self.num_experts = config.num_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
         self.world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
 
     def forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor) -> Tensor:
@@ -183,10 +195,27 @@ class TransformerBlock(nn.Module):
         mlp_y = self.ffn_norm(y)
 
         # mlp
-        z = self.ffn_down(F.silu(self.ffn_gate(mlp_y)) * self.ffn_up(mlp_y))
+        if self.moe:
+            # reference: https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/mixtral.py
+            # This is inefficient for small batch size since it calculates all experts
+            mlp_y = mlp_y.view(-1, mlp_y.shape[-1])
+            routing_weights = F.softmax(self.ffn_gate_inp(mlp_y), dim=1)
+            routing_weights, selected_experts = torch.topk(routing_weights,
+                                                           self.num_experts_per_tok,
+                                                           dim=-1)
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+            z = None
+            for idx in range(self.num_experts):
+                z_idx = self.ffn_down[idx](F.silu(self.ffn_gate[idx](mlp_y)) * self.ffn_up[idx](mlp_y))
+                expert_mask = (selected_experts == idx)
+                expert_weights = (routing_weights * expert_mask).sum(dim=-1,
+                                                                     keepdim=True)
+                z_idx = z_idx * expert_weights
+                z = z_idx if z is None else z + z_idx
+        else:
+            z = self.ffn_down(F.silu(self.ffn_gate(mlp_y)) * self.ffn_up(mlp_y))
         if self.world_size > 1:
             z = funcol.all_reduce(z, "sum", list(range(self.world_size)))
-
         z = z + y
         return z
 
@@ -228,7 +257,7 @@ class Linear(nn.Module):
     def forward(self, x):
         xshape = x.view(-1, x.shape[-1])
         if self.weight_type_int < 2:
-            output = xshape @ self.weight.T
+            output = xshape @ self.weight.view(self.outfeatures, self.infeatures).T
         # Force to use dequant for 2-bit model for now
         elif xshape.shape[0] == 1:
             output = torch.ops.llama_cpp.ggml_mul_mat_vec(self.weight, xshape, self.weight_type_int, self.outfeatures)
