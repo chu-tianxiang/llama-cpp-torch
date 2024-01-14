@@ -6,7 +6,7 @@ The `llama.cpp` library is a cornerstone in language modeling with a variety of 
 
 This repo provides an example for converting GGUF files back into PyTorch state dict, allowing you to run inference purely in PyTorch. For now only LLaMA is supported.
 
-The code is largely inspired by the original [`llama.cpp`](https://github.com/ggerganov/llama.cpp) and [`GPT-Fast`](https://github.com/pytorch-labs/gpt-fast). 
+The code is largely inspired by the original [`llama.cpp`](https://github.com/ggerganov/llama.cpp) and [`GPT-Fast`](https://github.com/pytorch-labs/gpt-fast).
 
 ## Getting Started
 
@@ -33,5 +33,3 @@ python generate.py --checkpoint_path TinyLlama-Q4_K_M --interactive --compile
 
 ## Todo
 * Add support to more model
-* Update GEMV kernel for IQ2_XXS and IQ2_XS
-* Tensor Parallel support

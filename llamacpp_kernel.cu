@@ -527,10 +527,10 @@ static __global__ void dequantize_block_q4_K(const void * __restrict__ vx, dst_t
 
     uint8_t sc, m;
     get_scale_min_k4(is + 0, x[i].scales, sc, m);
-    const half d1 = __hmul(dall, __int2half_rn(sc)); 
+    const half d1 = __hmul(dall, __int2half_rn(sc));
     const half m1 = __hmul(dmin,  __int2half_rn(m));
     get_scale_min_k4(is + 1, x[i].scales, sc, m);
-    const half d2 = __hmul(dall, __int2half_rn(sc)); 
+    const half d2 = __hmul(dall, __int2half_rn(sc));
     const half m2 = __hmul(dmin, __int2half_rn(m));
     for (int l = 0; l < n; ++l) {
         y[l + 0] = __hsub(__hmul(d1, __int2half_rn(q[l] & 0xF)), m1);
@@ -1191,6 +1191,111 @@ static __global__ void dequantize_mul_mat_vec_q6_k(const void * __restrict__ vx,
     }
 }
 
+static __global__ void dequantize_mul_mat_vec_iq2_xxs(const void * __restrict__ vx, const dfloat * __restrict__ yy, dfloat * __restrict__ dst, const int ncols, int nrows) {
+    const int row = blockIdx.x*blockDim.y + threadIdx.y;
+    if (row > nrows) return;
+
+    const int num_blocks_per_row = ncols / QK_K;
+    const int ib0 = row*num_blocks_per_row;
+
+    const block_iq2_xxs * x = (const block_iq2_xxs *)vx + ib0;
+
+    float tmp = 0; // partial sum for thread in warp
+
+    const int tid = threadIdx.x/4;
+    const int ix  = threadIdx.x%4;
+
+    const int q_offset = tid * 4;
+    const int y_offset = tid * 32;
+
+    for (int i = ix; i < num_blocks_per_row; i += 4) {
+
+        const half    * y = yy + i * QK_K + y_offset;
+        const uint16_t * q = x[i].qs + q_offset;
+
+        const uint8_t  * aux8 = (const uint8_t *)q;
+        uint32_t aux32 = q[2] | (q[3] << 16);
+        float sumi = 0;
+        for (int l = 0; l < 4; ++l) {
+            const uint8_t * grid = (const uint8_t *)(iq2xxs_grid + aux8[l]);
+            const uint8_t  signs = ksigns_iq2xs[aux32 & 127];
+            for (int j = 0; j < 8; ++j) {
+                sumi += __half2float(y[j]) * grid[j] * (signs & kmask_iq2xs[j] ? -1 : 1);
+            }
+            y += 8;
+            aux32 >>= 7;
+        }
+        tmp += sumi * __half2float(x[i].d) * (0.5f + aux32) * 0.25f;;
+    }
+
+    // sum up partial sums and write back result
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        tmp += __shfl_xor_sync(0xffffffff, tmp, mask, 32);
+    }
+
+    if (threadIdx.x == 0) {
+        dst[row] = __float2half(tmp);
+    }
+}
+
+static __global__ void dequantize_mul_mat_vec_iq2_xs(const void * __restrict__ vx, const dfloat * __restrict__ yy, dfloat * __restrict__ dst, const int ncols, int nrows) {
+    const int row = blockIdx.x*blockDim.y + threadIdx.y;
+    if (row > nrows) return;
+
+    const int num_blocks_per_row = ncols / QK_K;
+    const int ib0 = row*num_blocks_per_row;
+
+    const block_iq2_xs * x = (const block_iq2_xs *)vx + ib0;
+
+    float tmp = 0; // partial sum for thread in warp
+
+    const int tid = threadIdx.x/4;
+    const int ix  = threadIdx.x%4;
+
+    const int q_offset = tid * 4;
+    const int s_offset = tid;
+    const int y_offset = tid * 32;
+
+    for (int i = ix; i < num_blocks_per_row; i += 4) {
+        const half    * y = yy + i * QK_K + y_offset;
+        const uint16_t * q = x[i].qs + q_offset;
+        const uint8_t ls1 = x[i].scales[s_offset] & 0xf;
+        const uint8_t ls2 = x[i].scales[s_offset] >>  4;
+
+        float sumi1 = 0;
+        for (int l = 0; l < 2; ++l) {
+            const uint8_t * grid = (const uint8_t *)(iq2xs_grid + (q[l] & 511));
+            const uint8_t  signs = ksigns_iq2xs[q[l] >> 9];
+            for (int j = 0; j < 8; ++j) {
+                sumi1 += __half2float(y[j]) * grid[j] * (signs & kmask_iq2xs[j] ? -1 : 1);
+            }
+            y += 8;
+        }
+        float sumi2 = 0;
+        for (int l = 2; l < 4; ++l) {
+            const uint8_t * grid = (const uint8_t *)(iq2xs_grid + (q[l] & 511));
+            const uint8_t  signs = ksigns_iq2xs[q[l] >> 9];
+            for (int j = 0; j < 8; ++j) {
+                sumi2 += __half2float(y[j]) * grid[j] * (signs & kmask_iq2xs[j] ? -1 : 1);
+            }
+            y += 8;
+        }
+        const float d = __half2float(x[i].d) * 0.25f;
+        tmp += d * ((0.5f + ls1) * sumi1 + (0.5f + ls2) * sumi2);;
+    }
+
+    // sum up partial sums and write back result
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        tmp += __shfl_xor_sync(0xffffffff, tmp, mask, 32);
+    }
+
+    if (threadIdx.x == 0) {
+        dst[row] = __float2half(tmp);
+    }
+}
+
 static void dequantize_mul_mat_vec_q4_0_cuda(const void * vx, const dfloat * y, dfloat * dst, const int ncols, const int nrows, cudaStream_t stream) {
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
     // the number of rows may exceed maximum grid size in the y or z dimensions, use the x dimension instead
@@ -1269,6 +1374,16 @@ static void dequantize_mul_mat_vec_q6_K_cuda(const void * vx, const dfloat * y, 
     dequantize_mul_mat_vec_q6_k<<<block_nums, block_dims, 0, stream>>>(vx, y, dst, ncols, nrows);
 }
 
+static void dequantize_mul_mat_vec_iq2_xxs_cuda(const void * vx, const dfloat * y, dfloat * dst, const int ncols, const int nrows, cudaStream_t stream) {
+    const dim3 block_dims(32, 1, 1);
+    dequantize_mul_mat_vec_iq2_xxs<<<nrows, block_dims, 0, stream>>>(vx, y, dst, ncols, nrows);
+}
+
+static void dequantize_mul_mat_vec_iq2_xs_cuda(const void * vx, const dfloat * y, dfloat * dst, const int ncols, const int nrows, cudaStream_t stream) {
+    const dim3 block_dims(32, 1, 1);
+    dequantize_mul_mat_vec_iq2_xs<<<nrows, block_dims, 0, stream>>>(vx, y, dst, ncols, nrows);
+}
+
 torch::Tensor ggml_dequantize(
     torch::Tensor W,   // quant weight
     int8_t type,
@@ -1329,7 +1444,12 @@ torch::Tensor ggml_mul_mat_vec(
         case 14:
             dequantize_mul_mat_vec_q6_K_cuda((void*)W.data_ptr(), (half*)X.data_ptr(), (half*)Y.data_ptr(), col, row, stream);
             break;
+        case 16:
+            dequantize_mul_mat_vec_iq2_xxs_cuda((void*)W.data_ptr(), (half*)X.data_ptr(), (half*)Y.data_ptr(), col, row, stream);
+            break;
+        case 17:
+            dequantize_mul_mat_vec_iq2_xs_cuda((void*)W.data_ptr(), (half*)X.data_ptr(), (half*)Y.data_ptr(), col, row, stream);
+            break;
     }
     return Y;
 }
-

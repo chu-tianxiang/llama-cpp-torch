@@ -13,9 +13,11 @@ from typing import Optional, Tuple
 import torch
 import torch._dynamo.config
 import torch._inductor.config
+import torch.distributed as dist
 from sentencepiece import SentencePieceProcessor
 
 from model import Transformer
+from tp import maybe_init_dist, _get_world_size
 
 torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
@@ -128,7 +130,7 @@ def encode_tokens(tokenizer, string, bos=True, device='cuda'):
     return torch.tensor(tokens, dtype=torch.int, device=device)
 
 
-def _load_model(checkpoint_path, device, precision):
+def _load_model(checkpoint_path, device, precision, use_tp):
     with torch.device('meta'):
         model = Transformer.from_json(str(checkpoint_path / "config.json"))
 
@@ -137,6 +139,10 @@ def _load_model(checkpoint_path, device, precision):
     for name, module in model.named_modules():
         if hasattr(module, "weight_type"):
             module.weight_type_int = int(module.weight_type)
+
+    if use_tp:
+        from tp import apply_tp
+        apply_tp(model)
 
     model = model.to(device=device, dtype=precision)
     return model.eval()
@@ -160,14 +166,22 @@ def main(
     """
     tokenizer_path = checkpoint_path / "tokenizer.model"
     assert tokenizer_path.is_file(), tokenizer_path
-
     print(f"Using device={device}")
+
+    global print
+    rank = maybe_init_dist()
+    use_tp = rank is not None
+    if use_tp:
+        if rank != 0:
+            # only print on rank 0
+            print = lambda *args, **kwargs: None
+
     precision = torch.float16
     is_chat = "chat" in str(checkpoint_path).lower()
 
     print("Loading model ...")
     t0 = time.time()
-    model = _load_model(checkpoint_path, device, precision)
+    model = _load_model(checkpoint_path, device, precision, use_tp)
 
     device_sync(device=device) # MKG
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
@@ -176,13 +190,13 @@ def main(
     encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
     prompt_length = encoded.size(0)
 
-    torch.manual_seed(1234)
+    #torch.manual_seed(1234)
     if compile:
         global decode_one_token, prefill
         decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead", fullgraph=True)
 
         # Uncomment to squeeze more perf out of prefill
-        if args.compile_prefill:
+        if compile_prefill:
             prefill = torch.compile(prefill, fullgraph=True, dynamic=True)
 
 
@@ -194,7 +208,15 @@ def main(
     for i in range(start, num_samples):
         device_sync(device=device) # MKG
         if i >= 0 and interactive:
-            prompt = input("What is your prompt? ")
+            if not use_tp or rank == 0:
+                prompt = input("What is your prompt? ")
+            else:
+                prompt = ""
+            if use_tp:
+                prompt_list = [None for _ in range(_get_world_size())]
+                dist.all_gather_object(prompt_list, prompt)
+                prompt = prompt_list[0]
+
             if is_chat:
                 prompt = f"{B_INST} {prompt.strip()} {E_INST}"
             encoded = encode_tokens(tokenizer, prompt.strip(), bos=True, device=device)
@@ -250,7 +272,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_samples', type=int, default=5, help='Number of samples.')
     parser.add_argument('--max_new_tokens', type=int, default=200, help='Maximum number of new tokens.')
     parser.add_argument('--top_k', type=int, default=20, help='Top-k for sampling.')
-    parser.add_argument('--temperature', type=float, default=0.8, help='Temperature for sampling.')
+    parser.add_argument('--temperature', type=float, default=1.0, help='Temperature for sampling.')
     parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints"), help='Model checkpoint path.')
     parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')
     parser.add_argument('--compile_prefill', action='store_true', help='Whether to compile the prefill (improves prefill perf, but higher compile times)')

@@ -4,6 +4,7 @@
 
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
+import os
 import json
 from dataclasses import dataclass
 from typing import Optional
@@ -12,6 +13,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
+from torch.distributed import _functional_collectives as funcol
 
 import register_lib
 
@@ -149,6 +151,7 @@ class TransformerBlock(nn.Module):
         self.head_dim = config.head_dim
         self.n_local_heads = config.n_local_heads
         self.dim = config.dim
+        self.world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
 
     def forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor) -> Tensor:
         bsz, seqlen, _ = x.shape
@@ -171,12 +174,19 @@ class TransformerBlock(nn.Module):
         v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
+        y = self.attn_output(y)
 
-        y = x + self.attn_output(y)
+        if self.world_size > 1:
+            y = funcol.all_reduce(y, "sum", list(range(self.world_size)))
+
+        y = x + y
         mlp_y = self.ffn_norm(y)
 
         # mlp
         z = self.ffn_down(F.silu(self.ffn_gate(mlp_y)) * self.ffn_up(mlp_y))
+        if self.world_size > 1:
+            z = funcol.all_reduce(z, "sum", list(range(self.world_size)))
+
         z = z + y
         return z
 
@@ -218,13 +228,13 @@ class Linear(nn.Module):
     def forward(self, x):
         xshape = x.view(-1, x.shape[-1])
         if self.weight_type_int < 2:
-            output = x @ self.weight.T
+            output = xshape @ self.weight.T
         # Force to use dequant for 2-bit model for now
-        elif xshape.shape[0] == 1 and self.weight_type_int < 16:
+        elif xshape.shape[0] == 1:
             output = torch.ops.llama_cpp.ggml_mul_mat_vec(self.weight, xshape, self.weight_type_int, self.outfeatures)
         else:
             weight = torch.ops.llama_cpp.ggml_dequantize(self.weight, self.weight_type_int, self.outfeatures, self.infeatures)
-            output = x @ weight.T
+            output = xshape @ weight.T
         if self.bias is not None:
             output = output + self.bias
         output = output.view(*x.shape[:-1], self.outfeatures)
