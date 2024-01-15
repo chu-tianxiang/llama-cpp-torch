@@ -206,6 +206,7 @@ class TransformerBlock(nn.Module):
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
             z = None
             for idx in range(self.num_experts):
+                if self.ffn_gate[idx] is None: continue
                 z_idx = self.ffn_down[idx](F.silu(self.ffn_gate[idx](mlp_y)) * self.ffn_up[idx](mlp_y))
                 expert_mask = (selected_experts == idx)
                 expert_weights = (routing_weights * expert_mask).sum(dim=-1,

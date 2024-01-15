@@ -7,6 +7,7 @@
 import os
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -78,14 +79,17 @@ def _apply_tp_Transformer(Transformer: Transformer) -> None:
 
 
 def apply_tp(model: Transformer) -> None:
+    rank = _get_rank()
     world_size = _get_world_size()
     _apply_tp_Transformer(model)
     for block in model.blk:
         if isinstance(block.ffn_gate, nn.ModuleList):
-            for i in range(len(block.ffn_gate)):
-                _apply_tp_linear(block.ffn_gate[i], "colwise")
-                _apply_tp_linear(block.ffn_up[i], "colwise")
-                _apply_tp_linear(block.ffn_down[i], "rowwise")
+            # Expert parallel for MOE
+            expert_indicies = np.array_split(range(
+                block.num_experts), world_size)[rank].tolist()
+            block.ffn_gate = nn.ModuleList(block.ffn_gate[i] if i in expert_indicies else None for i in range(block.num_experts))
+            block.ffn_up = nn.ModuleList(block.ffn_up[i] if i in expert_indicies else None for i in range(block.num_experts))
+            block.ffn_down = nn.ModuleList(block.ffn_down[i] if i in expert_indicies else None for i in range(block.num_experts))
         else:
             _apply_tp_linear(block.ffn_gate, "colwise")
             _apply_tp_linear(block.ffn_up, "colwise")
