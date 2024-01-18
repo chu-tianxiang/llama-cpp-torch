@@ -13,7 +13,28 @@ import torch.distributed as dist
 from torch import nn
 
 from model import Transformer, Linear
-from constants import GGML_QUANT_SIZES
+
+QK_K = 256
+# Items here are (block size, type size)
+GGML_QUANT_SIZES = {
+    0:  (1, 4),
+    1:  (1, 2),
+    2: (32, 2 + 16),
+    3: (32, 2 + 2 + 16),
+    6: (32, 2 + 4 + 16),
+    7: (32, 2 + 2 + 4 + 16),
+    8: (32, 2 + 32),
+    9: (32, 4 + 4 + 32),
+    10: (256, 2 + 2 + QK_K // 16 + QK_K // 4),
+    11: (256, 2 + QK_K // 4 + QK_K // 8 + 12),
+    12: (256, 2 + 2 + QK_K // 2 + 12),
+    13: (256, 2 + 2 + QK_K // 2 + QK_K // 8 + 12),
+    14: (256, 2 + QK_K // 2 + QK_K // 4 + QK_K // 16),
+    15: (256, 4 + QK_K + QK_K // 8),
+    16: (256, 2 + QK_K // 4),
+    17: (256, 2 + QK_K // 4 + QK_K // 32),
+}
+
 
 def _get_rank() -> int:
     return int(os.environ.get("LOCAL_RANK", "0"))

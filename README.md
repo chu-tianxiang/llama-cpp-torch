@@ -19,7 +19,7 @@ python setup.py install
 * Convert GGUF file to torch state dict
 
 ```bash
-python gguf_reader.py --input tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --output TinyLlama-Q4_K_M
+python convert.py --input tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --output TinyLlama-Q4_K_M
 ```
 
 * Running inference

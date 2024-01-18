@@ -4,8 +4,6 @@
 
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-import itertools
-import sys
 import time
 from pathlib import Path
 from typing import Optional, Tuple
@@ -135,7 +133,7 @@ def _load_model(checkpoint_path, device, precision, use_tp):
         model = Transformer.from_json(str(checkpoint_path / "config.json"))
 
     checkpoint = torch.load(str(checkpoint_path / "pytorch_model.bin"), mmap=True, weights_only=True)
-    model.load_state_dict(checkpoint, strict=True, assign=True)
+    model.load_state_dict(checkpoint, strict=False, assign=True)
     for name, module in model.named_modules():
         if hasattr(module, "weight_type"):
             module.weight_type_int = int(module.weight_type)

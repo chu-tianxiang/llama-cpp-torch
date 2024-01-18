@@ -72,7 +72,7 @@ class Transformer(nn.Module):
         super().__init__()
         self.config = config
 
-        self.token_embd = nn.Embedding(config.vocab_size, config.dim)
+        self.token_embd = Embedding(config.vocab_size, config.dim)
         self.blk = nn.ModuleList(TransformerBlock(config) for _ in range(config.n_layer))
         self.output_norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.output = Linear(config.dim, config.vocab_size, bias=False)
@@ -81,21 +81,6 @@ class Transformer(nn.Module):
         self.mask_cache: Optional[Tensor] = None
         self.max_batch_size = -1
         self.max_seq_length = -1
-
-    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
-        # Pre-dequantize the embedding layer because nn.Embedding doesn't support quantized weight
-        if prefix + 'token_embd.weight' in state_dict:
-             dtype = int(state_dict[prefix + 'token_embd.weight_type'])
-             if dtype >= 2:
-                 weight = torch.ops.llama_cpp.ggml_dequantize(state_dict[prefix + 'token_embd.weight'].cuda(), dtype, self.config.vocab_size, self.config.dim)
-                 state_dict[prefix + 'token_embd.weight'] = weight.cpu()
-             del state_dict[prefix + 'token_embd.weight_type']
-        # ignore weight type in layernorm
-        for key in tuple(state_dict.keys()):
-            if 'norm.weight_type' in key:
-                del state_dict[key]
-
-        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def setup_caches(self, max_batch_size, max_seq_length):
         if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
@@ -236,12 +221,13 @@ class RMSNorm(nn.Module):
 
 
 class Linear(nn.Module):
+    """Quantized linear layer"""
     def __init__(self, infeatures, outfeatures, bias, **kwargs):
         super().__init__()
         self.infeatures = infeatures
         self.outfeatures = outfeatures
         # Fake weight
-        self.register_buffer('weight', torch.zeros(()))
+        self.register_buffer('weight', torch.nn.parameter.UninitializedBuffer())
         self.register_buffer('weight_type', torch.zeros((), dtype=torch.int))
 
         if bias:
@@ -252,7 +238,8 @@ class Linear(nn.Module):
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         if prefix + 'weight' in state_dict:
-             setattr(self, 'weight', state_dict[prefix + 'weight'].clone())
+             weight = state_dict[prefix + 'weight']
+             self.weight.materialize(weight.shape, dtype=weight.dtype)
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def forward(self, x):
@@ -269,6 +256,31 @@ class Linear(nn.Module):
             output = output + self.bias
         output = output.view(*x.shape[:-1], self.outfeatures)
         return output
+
+class Embedding(nn.Module):
+    """Quantized embedding layer"""
+    def __init__(self, vocab_size, dim):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.dim = dim
+        # Fake weight
+        self.register_buffer('weight', torch.nn.parameter.UninitializedBuffer())
+        self.register_buffer('weight_type', torch.zeros((), dtype=torch.int))
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        if prefix + 'weight' in state_dict:
+             weight = state_dict[prefix + 'weight']
+             self.weight.materialize(weight.shape, dtype=weight.dtype)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    def forward(self, ind):
+        if self.weight_type_int < 2:
+            return torch.embedding(self.weight.view(self.vocab_size, self.dim), ind)
+        ind_flat = ind.flatten()
+        quant = torch.index_select(self.weight.view(self.vocab_size, -1), dim=0, index=ind_flat)
+        dequant = torch.ops.llama_cpp.ggml_dequantize(quant, self.weight_type_int,
+                                                      self.dim, ind_flat.shape[0])
+        return dequant.view(*ind.shape, self.dim)
 
 
 def precompute_freqs_cis(
