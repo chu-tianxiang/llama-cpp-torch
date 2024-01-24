@@ -15,7 +15,23 @@ torch::Tensor ggml_mul_mat_vec(
     int64_t m
 );
 
+torch::Tensor ggml_mul_mat_vec_a8(
+    torch::Tensor W,  // quant weight
+    torch::Tensor X,  // input
+    int8_t type,
+    int64_t row
+);
+
+torch::Tensor void ggml_mul_mat_a8(
+    torch::Tensor W,  // quant weight
+    torch::Tensor X,  // input
+    int8_t type,
+    int64_t row
+);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("ggml_dequantize", &ggml_dequantize, "ggml_dequantize");
     m.def("ggml_mul_mat_vec", &ggml_mul_mat_vec, "ggml_mul_mat_vec");
+    m.def("ggml_mul_mat_vec_a8", &ggml_mul_mat_vec_a8, "ggml_mul_mat_vec_a8");
+    m.def("ggml_mul_mat_a8", &ggml_mul_mat_a8, "ggml_mul_mat_a8");
 }

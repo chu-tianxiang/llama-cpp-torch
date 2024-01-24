@@ -248,7 +248,9 @@ class Linear(nn.Module):
             output = xshape @ self.weight.view(self.outfeatures, self.infeatures).T
         # Force to use dequant for 2-bit model for now
         elif xshape.shape[0] == 1:
-            output = torch.ops.llama_cpp.ggml_mul_mat_vec(self.weight, xshape, self.weight_type_int, self.outfeatures)
+            output = torch.ops.llama_cpp.ggml_mul_mat_vec_a8(self.weight, xshape, self.weight_type_int, self.outfeatures)
+        elif xshape.shape[0] < 8 and self.weight_type_int < 16:
+            output = torch.ops.llama_cpp.ggml_mul_mat_a8(self.weight, xshape, self.weight_type_int, self.outfeatures)
         else:
             weight = torch.ops.llama_cpp.ggml_dequantize(self.weight, self.weight_type_int, self.outfeatures, self.infeatures)
             output = xshape @ weight.T
