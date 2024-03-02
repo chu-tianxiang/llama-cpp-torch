@@ -37,6 +37,7 @@ class ModelArgs:
     moe: bool = False
     num_experts: int = 1
     num_experts_per_tok: int = 1
+    hidden_act: str = "silu"
 
     def __post_init__(self):
         if self.n_local_heads == -1:
@@ -121,14 +122,15 @@ class TransformerBlock(nn.Module):
         self.attn_norm = RMSNorm(config.dim, config.norm_eps)
 
         # Attention layer
-        self.attn_q = Linear(config.dim, config.n_head * config.head_dim, bias=False)
-        self.attn_k = Linear(config.dim, config.n_local_heads * config.head_dim, bias=False)
-        self.attn_v = Linear(config.dim, config.n_local_heads * config.head_dim, bias=False)
+        self.attn_q = Linear(config.dim, config.n_head * config.head_dim, bias=True)
+        self.attn_k = Linear(config.dim, config.n_local_heads * config.head_dim, bias=True)
+        self.attn_v = Linear(config.dim, config.n_local_heads * config.head_dim, bias=True)
         self.attn_output = Linear(config.dim, config.dim, bias=False)
         self.kv_cache = None
 
         # ffn norm
         self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
+        self.act_fn = F.gelu if config.hidden_act == "gelu" else F.silu
 
         # ffn layer
         if config.moe:
@@ -192,14 +194,14 @@ class TransformerBlock(nn.Module):
             z = None
             for idx in range(self.num_experts):
                 if self.ffn_gate[idx] is None: continue
-                z_idx = self.ffn_down[idx](F.silu(self.ffn_gate[idx](mlp_y)) * self.ffn_up[idx](mlp_y))
+                z_idx = self.ffn_down[idx](self.act_fn(self.ffn_gate[idx](mlp_y)) * self.ffn_up[idx](mlp_y))
                 expert_mask = (selected_experts == idx)
                 expert_weights = (routing_weights * expert_mask).sum(dim=-1,
                                                                      keepdim=True)
                 z_idx = z_idx * expert_weights
                 z = z_idx if z is None else z + z_idx
         else:
-            z = self.ffn_down(F.silu(self.ffn_gate(mlp_y)) * self.ffn_up(mlp_y))
+            z = self.ffn_down(self.act_fn(self.ffn_gate(mlp_y)) * self.ffn_up(mlp_y))
         if self.world_size > 1:
             z = funcol.all_reduce(z, "sum", list(range(self.world_size)))
         z = z + y

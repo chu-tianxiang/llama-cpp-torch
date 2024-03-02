@@ -4,6 +4,7 @@
 
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
+import json
 import time
 from pathlib import Path
 from typing import Optional, Tuple
@@ -13,6 +14,7 @@ import torch._dynamo.config
 import torch._inductor.config
 import torch.distributed as dist
 from sentencepiece import SentencePieceProcessor
+from gpt2_tokenizer import GPT2Tokenizer
 
 from model import Transformer
 from tp import maybe_init_dist, _get_world_size
@@ -121,8 +123,23 @@ def generate(
     return seq
 
 
-def encode_tokens(tokenizer, string, bos=True, device='cuda'):
-    tokens = tokenizer.encode(string)
+def encode_tokens(tokenizer, special_tokens, string, bos=True, device='cuda'):
+    text_list = [string]
+    for token in special_tokens:
+        new_text_list = []
+        for text in text_list:
+            text = text.split(token)
+            new_text_list.extend([e for pair in zip(text, [token] * (len(text) - 1)) for e in pair] + [text[-1]])
+        text_list = new_text_list
+
+    tokens = []
+    for text in text_list:
+        if not text:
+            continue
+        if text in special_tokens:
+            tokens.append(int(special_tokens[text]))
+        else:
+            tokens.extend(tokenizer.encode(text))
     if bos:
         tokens = [tokenizer.bos_id()] + tokens
     return torch.tensor(tokens, dtype=torch.int, device=device)
@@ -134,6 +151,13 @@ def _load_model(checkpoint_path, device, precision, use_tp):
 
     checkpoint = torch.load(str(checkpoint_path / "pytorch_model.bin"), mmap=True, weights_only=True)
     model.load_state_dict(checkpoint, strict=False, assign=True)
+    # Fixed tied embedding
+    if model.output.weight.device == torch.device("meta"):
+        model.output.weight = model.token_embd.weight
+        model.output.weight_type = model.token_embd.weight_type
+
+    model = model._apply(lambda t: torch.zeros_like(t, device="cpu")
+                             if t.device == torch.device("meta") else t)
     for name, module in model.named_modules():
         if hasattr(module, "weight_type"):
             module.weight_type_int = int(module.weight_type)
@@ -163,8 +187,16 @@ def main(
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
     """
     tokenizer_path = checkpoint_path / "tokenizer.model"
-    assert tokenizer_path.is_file(), tokenizer_path
-    print(f"Using device={device}")
+    use_spm = True
+    if not tokenizer_path.is_file():
+        use_spm = False
+        tokenizer_path = (checkpoint_path / "vocab.json",
+                          checkpoint_path / "merges.txt",
+                          checkpoint_path / "tokenizer_config.json")
+
+    B_INST, E_INST = "[INST]", "[/INST]"
+    if "qwen" in str(checkpoint_path).lower():
+        B_INST, E_INST = "<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n"
 
     global print
     rank = maybe_init_dist()
@@ -184,8 +216,14 @@ def main(
     device_sync(device=device) # MKG
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
 
-    tokenizer = SentencePieceProcessor(model_file=str(tokenizer_path))
-    encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
+    if use_spm:
+        tokenizer = SentencePieceProcessor(model_file=str(tokenizer_path))
+    else:
+        tokenizer = GPT2Tokenizer(*tokenizer_path)
+    tokenizer_conf = json.load(open(checkpoint_path / "tokenizer_config.json"))
+    special_tokens = {v["content"]: k for k, v in tokenizer_conf.get("added_tokens_decoder", {}).items()}
+    encoded = encode_tokens(tokenizer, special_tokens, prompt,
+                            bos=tokenizer_conf.get("add_bos_token", False), device=device)
     prompt_length = encoded.size(0)
 
     #torch.manual_seed(1234)
@@ -217,7 +255,7 @@ def main(
 
             if is_chat:
                 prompt = f"{B_INST} {prompt.strip()} {E_INST}"
-            encoded = encode_tokens(tokenizer, prompt.strip(), bos=True, device=device)
+            encoded = encode_tokens(tokenizer, special_tokens, prompt.strip(), bos=tokenizer_conf.get("add_bos_token", False), device=device)
 
         if interactive and i >= 0:
             buffer = []
