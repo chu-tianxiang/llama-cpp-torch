@@ -1,10 +1,8 @@
 # Convert [`llama.cpp`](https://github.com/ggerganov/llama.cpp) to Pytorch
 
-Note: this is a work in progress.
-
 The `llama.cpp` library is a cornerstone in language modeling with a variety of quantization techniques, but it's largely used within its own ecosystem. This repo's aim is to make these methods more accessible to the PyTorch community.
 
-This repo provides an example for converting GGUF files back into PyTorch state dict, allowing you to run inference purely in PyTorch. For now only LLaMA and Mixtral is supported.
+This repo provides an example for converting GGUF files back into PyTorch state dict, allowing you to run inference purely in PyTorch. For now only LLaMA, Mixtral and Qwen2 are supported.
 
 The code is largely inspired by the original [`llama.cpp`](https://github.com/ggerganov/llama.cpp) and [`GPT-Fast`](https://github.com/pytorch-labs/gpt-fast).
 
