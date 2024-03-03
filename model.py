@@ -24,6 +24,7 @@ def find_multiple(n: int, k: int) -> int:
 
 @dataclass
 class ModelArgs:
+    architecture: str = "llama"
     block_size: int = 2048
     vocab_size: int = 32000
     n_layer: int = 32
@@ -31,13 +32,15 @@ class ModelArgs:
     dim: int = 4096
     intermediate_size: int = None
     n_local_heads: int = -1
-    head_dim: int = 64
+    head_dim: int = -1
     rope_base: float = 10000
+    rope_type: str = "none"
     norm_eps: float = 1e-5
     moe: bool = False
     num_experts: int = 1
     num_experts_per_tok: int = 1
     hidden_act: str = "silu"
+    mlp_gate: bool = True
 
     def __post_init__(self):
         if self.n_local_heads == -1:
@@ -46,7 +49,8 @@ class ModelArgs:
             hidden_dim = 4 * self.dim
             n_hidden = int(2 * hidden_dim / 3)
             self.intermediate_size = find_multiple(n_hidden, 256)
-        self.head_dim = self.dim // self.n_head
+        if self.head_dim == -1:
+            self.head_dim = self.dim // self.n_head
 
 
 class KVCache(nn.Module):
@@ -101,6 +105,8 @@ class Transformer(nn.Module):
         mask = self.causal_mask[None, None, input_pos]
         freqs_cis = self.freqs_cis[input_pos]
         x = self.token_embd(idx)
+        if self.config.architecture == "gemma":
+            x = x * (self.config.dim ** 0.5)
 
         for i, layer in enumerate(self.blk):
             x = layer(x, input_pos, freqs_cis, mask)
@@ -116,32 +122,45 @@ class Transformer(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
+        self.config = config
         assert config.dim % config.n_head == 0
 
         # Attention norm
         self.attn_norm = RMSNorm(config.dim, config.norm_eps)
 
         # Attention layer
-        self.attn_q = Linear(config.dim, config.n_head * config.head_dim, bias=True)
-        self.attn_k = Linear(config.dim, config.n_local_heads * config.head_dim, bias=True)
-        self.attn_v = Linear(config.dim, config.n_local_heads * config.head_dim, bias=True)
-        self.attn_output = Linear(config.dim, config.dim, bias=False)
+        # https://github.com/pacman100/llama.cpp/blob/ee5b171250f707b08334aa8dcda259888bc2ccc6/gguf-py/gguf/tensor_mapping.py#L97
+        if config.architecture in ["qwen"]:
+            self.concat_qkv = True
+            self.attn_qkv = Linear(config.dim, config.head_dim * (config.n_head + config.n_local_heads * 2), bias=True)
+        else:
+            self.concat_qkv = False
+            self.attn_q = Linear(config.dim, config.n_head * config.head_dim, bias=True)
+            self.attn_k = Linear(config.dim, config.n_local_heads * config.head_dim, bias=True)
+            self.attn_v = Linear(config.dim, config.n_local_heads * config.head_dim, bias=True)
+        self.attn_output = Linear(config.dim, config.dim, bias=True)
         self.kv_cache = None
 
         # ffn norm
         self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
-        self.act_fn = F.gelu if config.hidden_act == "gelu" else F.silu
+        if config.hidden_act == "gelu_tanh":
+            self.act_fn = nn.GELU(approximate="tanh")
+        elif config.hidden_act == "gelu":
+            self.act_fn = nn.GELU()
+        else:
+            self.act_fn = nn.SiLU()
 
         # ffn layer
         if config.moe:
-            self.ffn_gate_inp = Linear(config.dim, config.num_experts, bias=False)
-            self.ffn_gate = nn.ModuleList(Linear(config.dim, config.intermediate_size, bias=False) for _ in range(config.num_experts))
-            self.ffn_up = nn.ModuleList(Linear(config.dim, config.intermediate_size, bias=False) for _ in range(config.num_experts))
-            self.ffn_down = nn.ModuleList(Linear(config.intermediate_size, config.dim, bias=False) for _ in range(config.num_experts))
+            self.ffn_gate_inp = Linear(config.dim, config.num_experts, bias=True)
+            self.ffn_gate = nn.ModuleList(Linear(config.dim, config.intermediate_size, bias=True) for _ in range(config.num_experts))
+            self.ffn_up = nn.ModuleList(Linear(config.dim, config.intermediate_size, bias=True) for _ in range(config.num_experts))
+            self.ffn_down = nn.ModuleList(Linear(config.intermediate_size, config.dim, bias=True) for _ in range(config.num_experts))
         else:
-            self.ffn_gate = Linear(config.dim, config.intermediate_size, bias=False)
-            self.ffn_up = Linear(config.dim, config.intermediate_size, bias=False)
-            self.ffn_down = Linear(config.intermediate_size, config.dim, bias=False)
+            if config.mlp_gate:
+                self.ffn_gate = Linear(config.dim, config.intermediate_size, bias=True)
+            self.ffn_up = Linear(config.dim, config.intermediate_size, bias=True)
+            self.ffn_down = Linear(config.intermediate_size, config.dim, bias=True)
 
         self.n_head = config.n_head
         self.head_dim = config.head_dim
@@ -150,6 +169,7 @@ class TransformerBlock(nn.Module):
         self.moe = config.moe
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
+        self.rope_type = config.rope_type
         self.world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
 
     def forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor) -> Tensor:
@@ -157,12 +177,17 @@ class TransformerBlock(nn.Module):
 
         attn_x = self.attn_norm(x)
         # attention
-        q = self.attn_q(attn_x).view(bsz, seqlen, self.n_head, self.head_dim)
-        k = self.attn_k(attn_x).view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        v = self.attn_v(attn_x).view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        if self.concat_qkv:
+            qkv = self.attn_qkv(attn_x).view(bsz, seqlen, -1, self.head_dim)
+            q, k, v = qkv.split([self.n_head, self.n_local_heads, self.n_local_heads],
+                                dim=2)
+        else:
+            q = self.attn_q(attn_x).view(bsz, seqlen, self.n_head, self.head_dim)
+            k = self.attn_k(attn_x).view(bsz, seqlen, self.n_local_heads, self.head_dim)
+            v = self.attn_v(attn_x).view(bsz, seqlen, self.n_local_heads, self.head_dim)
 
-        q = apply_rotary_emb(q, freqs_cis)
-        k = apply_rotary_emb(k, freqs_cis)
+        q = apply_rotary_emb(q, freqs_cis, self.rope_type)
+        k = apply_rotary_emb(k, freqs_cis, self.rope_type)
 
         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
 
@@ -179,6 +204,7 @@ class TransformerBlock(nn.Module):
             y = funcol.all_reduce(y, "sum", list(range(self.world_size)))
 
         y = x + y
+
         mlp_y = self.ffn_norm(y)
 
         # mlp
@@ -200,11 +226,16 @@ class TransformerBlock(nn.Module):
                                                                      keepdim=True)
                 z_idx = z_idx * expert_weights
                 z = z_idx if z is None else z + z_idx
-        else:
+        elif self.config.mlp_gate:
             z = self.ffn_down(self.act_fn(self.ffn_gate(mlp_y)) * self.ffn_up(mlp_y))
+        else:
+            z = self.ffn_down(self.act_fn(self.ffn_up(mlp_y)))
+
         if self.world_size > 1:
             z = funcol.all_reduce(z, "sum", list(range(self.world_size)))
+
         z = z + y
+
         return z
 
 
@@ -251,7 +282,7 @@ class Linear(nn.Module):
         # Force to use dequant for 2-bit model for now
         elif xshape.shape[0] == 1:
             output = torch.ops.llama_cpp.ggml_mul_mat_vec_a8(self.weight, xshape, self.weight_type_int, self.outfeatures)
-        elif xshape.shape[0] < 8 and self.weight_type_int < 16:
+        elif xshape.shape[0] <= 8 and self.weight_type_int < 16:
             output = torch.ops.llama_cpp.ggml_mul_mat_a8(self.weight, xshape, self.weight_type_int, self.outfeatures)
         else:
             weight = torch.ops.llama_cpp.ggml_dequantize(self.weight, self.weight_type_int, self.outfeatures, self.infeatures)
@@ -298,16 +329,27 @@ def precompute_freqs_cis(
     return cache.to(dtype=torch.float16)
 
 
-def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
-    xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
-    freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2)
-    x_out2 = torch.stack(
-        [
-            xshaped[..., 0] * freqs_cis[..., 0] - xshaped[..., 1] * freqs_cis[..., 1],
-            xshaped[..., 1] * freqs_cis[..., 0] + xshaped[..., 0] * freqs_cis[..., 1],
-        ],
-        -1,
-    )
+def apply_rotary_emb(x: Tensor, freqs_cis: Tensor, rope_type: str) -> Tensor:
+    if rope_type == "norm":
+        xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
+        freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2)
+        x_out2 = torch.stack(
+            [
+                xshaped[..., 0] * freqs_cis[..., 0] - xshaped[..., 1] * freqs_cis[..., 1],
+                xshaped[..., 1] * freqs_cis[..., 0] + xshaped[..., 0] * freqs_cis[..., 1],
+            ],
+            -1,
+        )
+    else:
+        xshaped = x.float().reshape(*x.shape[:-1], 2, -1)
+        freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(-1), 2)
+        x_out2 = torch.stack(
+            [
+                xshaped[..., 0, :] * freqs_cis[..., 0] - xshaped[..., 1, :] * freqs_cis[..., 1],
+                xshaped[..., 1, :] * freqs_cis[..., 0] + xshaped[..., 0, :] * freqs_cis[..., 1],
+	    ],
+	    -1,
+        )
 
     x_out2 = x_out2.flatten(3)
     return x_out2.type_as(x)

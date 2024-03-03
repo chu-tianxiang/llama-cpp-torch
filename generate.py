@@ -141,7 +141,9 @@ def encode_tokens(tokenizer, special_tokens, string, bos=True, device='cuda'):
         else:
             tokens.extend(tokenizer.encode(text))
     if bos:
-        tokens = [tokenizer.bos_id()] + tokens
+        # some spm model has wrong set bos
+        bos_id = tokenizer.bos_id() if tokenizer.bos_id() > 0 else 2
+        tokens = [bos_id] + tokens
     return torch.tensor(tokens, dtype=torch.int, device=device)
 
 
@@ -150,6 +152,7 @@ def _load_model(checkpoint_path, device, precision, use_tp):
         model = Transformer.from_json(str(checkpoint_path / "config.json"))
 
     checkpoint = torch.load(str(checkpoint_path / "pytorch_model.bin"), mmap=True, weights_only=True)
+
     model.load_state_dict(checkpoint, strict=False, assign=True)
     # Fixed tied embedding
     if model.output.weight.device == torch.device("meta"):
@@ -157,7 +160,7 @@ def _load_model(checkpoint_path, device, precision, use_tp):
         model.output.weight_type = model.token_embd.weight_type
 
     model = model._apply(lambda t: torch.zeros_like(t, device="cpu")
-                             if t.device == torch.device("meta") else t)
+                         if t.device == torch.device("meta") else t)
     for name, module in model.named_modules():
         if hasattr(module, "weight_type"):
             module.weight_type_int = int(module.weight_type)
@@ -195,7 +198,9 @@ def main(
                           checkpoint_path / "tokenizer_config.json")
 
     B_INST, E_INST = "[INST]", "[/INST]"
-    if "qwen" in str(checkpoint_path).lower():
+    arch = json.load(open(checkpoint_path / "config.json"))["architecture"]
+
+    if arch in ["qwen2", "internlm2"]:
         B_INST, E_INST = "<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n"
 
     global print
@@ -255,7 +260,8 @@ def main(
 
             if is_chat:
                 prompt = f"{B_INST} {prompt.strip()} {E_INST}"
-            encoded = encode_tokens(tokenizer, special_tokens, prompt.strip(), bos=tokenizer_conf.get("add_bos_token", False), device=device)
+            encoded = encode_tokens(tokenizer, special_tokens, prompt.strip(),
+                                    bos=tokenizer_conf.get("add_bos_token", False), device=device)
 
         if interactive and i >= 0:
             buffer = []

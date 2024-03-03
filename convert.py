@@ -13,7 +13,7 @@ def convert_to_state_dict(checkpoint, save_dir):
     result = GGUFReader(checkpoint)
     architecture = result.fields['general.architecture']
     architecture = str(bytes(architecture.parts[architecture.data[0]]), encoding = 'utf-8')
-    if architecture not in ["llama", "qwen2"]:
+    if architecture not in ["llama", "qwen2", "internlm2"]:
         print(f"Unsupported architecture {architecture}")
         return
     # write tensor
@@ -106,10 +106,28 @@ def convert_to_state_dict(checkpoint, save_dir):
     n_head = int(result.fields[f'{architecture}.attention.head_count'].parts[-1])
     n_local_heads = int(result.fields[f'{architecture}.attention.head_count_kv'].parts[-1])
     intermediate_size = int(result.fields[f'{architecture}.feed_forward_length'].parts[-1])
-    norm_eps = float(result.fields[f'{architecture}.attention.layer_norm_rms_epsilon'].parts[-1])
     dim = int(result.fields[f'{architecture}.embedding_length'].parts[-1])
-    hidden_act = "silu"
+    # https://github.com/ggerganov/llama.cpp/blob/9731134296af3a6839cd682e51d9c2109a871de5/llama.cpp#L12301
+    if architecture in ["qwen2", "gemma", "qwen", "stablelm", "startcoder2"]:
+        rope_type = "neox"
+    elif architecture in ["llama", "internlm2", "baichuan", "startcoder", "orion"]:
+        rope_type = "norm"
+    else:
+        rope_type = "none"
+
+    if architecture in ["gemma"]:
+        hidden_act = "gelu"
+    elif architecture in ["starcoder2"]:
+        hidden_act = "gelu_tanh"
+    else:
+        hidden_act = "silu"
+
+    if architecture in ["starcoder2"]:
+        mlp_gate = False
+    else:
+        mlp_gate = True
     model_config= {
+        "architecture": architecture,
         "block_size": context_length,
         "vocab_size": vocab_size,
         "n_layer": n_layer,
@@ -117,9 +135,14 @@ def convert_to_state_dict(checkpoint, save_dir):
         "dim": dim,
         "intermediate_size": intermediate_size,
         "n_local_heads": n_local_heads,
-        "norm_eps": norm_eps,
-        "hidden_act": hidden_act
+        "hidden_act": hidden_act,
+        "rope_type": rope_type,
+        "mlp_gate": mlp_gate
     }
+    if f'{architecture}.attention.layer_norm_rms_epsilon' in result.fields:
+        model_config['norm_eps'] = float(result.fields[f'{architecture}.attention.layer_norm_rms_epsilon'].parts[-1])
+    if f'{architecture}.attention.key_length' in result.fields:
+        model_config['head_dim'] = int(result.fields[f'{architecture}.attention.key_length'].parts[-1])
     if f'{architecture}.rope.freq_base' in result.fields:
         model_config['rope_base'] = float(result.fields[f'{architecture}.rope.freq_base'].parts[-1])
     if f'{architecture}.expert_count' in result.fields:
