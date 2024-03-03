@@ -41,6 +41,7 @@ class ModelArgs:
     num_experts_per_tok: int = 1
     hidden_act: str = "silu"
     mlp_gate: bool = True
+    layernorm: bool = False
 
     def __post_init__(self):
         if self.n_local_heads == -1:
@@ -79,7 +80,10 @@ class Transformer(nn.Module):
 
         self.token_embd = Embedding(config.vocab_size, config.dim)
         self.blk = nn.ModuleList(TransformerBlock(config) for _ in range(config.n_layer))
-        self.output_norm = RMSNorm(config.dim, eps=config.norm_eps)
+        if config.layernorm:
+            self.output_norm = nn.LayerNorm(config.dim, eps=config.norm_eps)
+        else:
+            self.output_norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.output = Linear(config.dim, config.vocab_size, bias=False)
 
         self.freqs_cis: Optional[Tensor] = None
@@ -105,8 +109,8 @@ class Transformer(nn.Module):
         mask = self.causal_mask[None, None, input_pos]
         freqs_cis = self.freqs_cis[input_pos]
         x = self.token_embd(idx)
-        if self.config.architecture == "gemma":
-            x = x * (self.config.dim ** 0.5)
+        # if self.config.architecture == "gemma":
+        #     x = x * (self.config.dim ** 0.5)
 
         for i, layer in enumerate(self.blk):
             x = layer(x, input_pos, freqs_cis, mask)
@@ -126,11 +130,14 @@ class TransformerBlock(nn.Module):
         assert config.dim % config.n_head == 0
 
         # Attention norm
-        self.attn_norm = RMSNorm(config.dim, config.norm_eps)
+        if config.layernorm:
+            self.attn_norm = nn.LayerNorm(config.dim, eps=config.norm_eps)
+        else:
+            self.attn_norm = RMSNorm(config.dim, config.norm_eps)
 
         # Attention layer
         # https://github.com/pacman100/llama.cpp/blob/ee5b171250f707b08334aa8dcda259888bc2ccc6/gguf-py/gguf/tensor_mapping.py#L97
-        if config.architecture in ["qwen"]:
+        if config.architecture in ["qwen", "phi2"]:
             self.concat_qkv = True
             self.attn_qkv = Linear(config.dim, config.head_dim * (config.n_head + config.n_local_heads * 2), bias=True)
         else:
@@ -142,7 +149,10 @@ class TransformerBlock(nn.Module):
         self.kv_cache = None
 
         # ffn norm
-        self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
+        if config.layernorm:
+            self.ffn_norm = nn.LayerNorm(config.dim, eps=config.norm_eps)
+        else:
+            self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
         if config.hidden_act == "gelu_tanh":
             self.act_fn = nn.GELU(approximate="tanh")
         elif config.hidden_act == "gelu":
@@ -205,7 +215,10 @@ class TransformerBlock(nn.Module):
 
         y = x + y
 
-        mlp_y = self.ffn_norm(y)
+        if self.config.architecture == "phi2":
+            mlp_y = attn_x
+        else:
+            mlp_y = self.ffn_norm(y)
 
         # mlp
         if self.moe:
@@ -282,7 +295,7 @@ class Linear(nn.Module):
         # Force to use dequant for 2-bit model for now
         elif xshape.shape[0] == 1:
             output = torch.ops.llama_cpp.ggml_mul_mat_vec_a8(self.weight, xshape, self.weight_type_int, self.outfeatures)
-        elif xshape.shape[0] <= 8 and self.weight_type_int < 16:
+        elif xshape.shape[0] < 8 and self.weight_type_int < 16:
             output = torch.ops.llama_cpp.ggml_mul_mat_a8(self.weight, xshape, self.weight_type_int, self.outfeatures)
         else:
             weight = torch.ops.llama_cpp.ggml_dequantize(self.weight, self.weight_type_int, self.outfeatures, self.infeatures)
@@ -347,8 +360,8 @@ def apply_rotary_emb(x: Tensor, freqs_cis: Tensor, rope_type: str) -> Tensor:
             [
                 xshaped[..., 0, :] * freqs_cis[..., 0] - xshaped[..., 1, :] * freqs_cis[..., 1],
                 xshaped[..., 1, :] * freqs_cis[..., 0] + xshaped[..., 0, :] * freqs_cis[..., 1],
-	    ],
-	    -1,
+            ],
+            -1,
         )
 
     x_out2 = x_out2.flatten(3)

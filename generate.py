@@ -159,6 +159,8 @@ def _load_model(checkpoint_path, device, precision, use_tp):
         model.output.weight = model.token_embd.weight
         model.output.weight_type = model.token_embd.weight_type
 
+    #for k,v in list(model.named_parameters()) + list(model.named_buffers()):
+    #    print(k, v.device)
     model = model._apply(lambda t: torch.zeros_like(t, device="cpu")
                          if t.device == torch.device("meta") else t)
     for name, module in model.named_modules():
@@ -172,8 +174,6 @@ def _load_model(checkpoint_path, device, precision, use_tp):
     model = model.to(device=device, dtype=precision)
     return model.eval()
 
-
-B_INST, E_INST = "[INST]", "[/INST]"
 
 def main(
     prompt: str = "Hello, my name is",

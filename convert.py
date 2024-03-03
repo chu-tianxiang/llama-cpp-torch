@@ -13,7 +13,7 @@ def convert_to_state_dict(checkpoint, save_dir):
     result = GGUFReader(checkpoint)
     architecture = result.fields['general.architecture']
     architecture = str(bytes(architecture.parts[architecture.data[0]]), encoding = 'utf-8')
-    if architecture not in ["llama", "qwen2", "internlm2"]:
+    if architecture not in ["llama", "qwen2", "internlm2", "starcoder2", "qwen"]:
         print(f"Unsupported architecture {architecture}")
         return
     # write tensor
@@ -45,10 +45,10 @@ def convert_to_state_dict(checkpoint, save_dir):
         vocab_list = []
         for i, idx in enumerate(tokens.data):
             token = str(bytes(tokens.parts[idx]), encoding='utf-8')
-            if token.startswith("[PAD") or token.startswith("<dummy"):
-                break
-            vocab_list.append(token)
             token_type = int(types.parts[types.data[i]])
+            #if (token.startswith("[PAD") or token.startswith("<dummy")) and token_type == 4:
+            #    break
+            vocab_list.append(token)
             vocab[token] = i
             if token_type == 3:
                 special_vocab[i] = {"content": token, "special": True}
@@ -71,12 +71,12 @@ def convert_to_state_dict(checkpoint, save_dir):
         for i in range(vocab_size):
             new_token = vocab.SentencePiece()
             new_token.piece = str(bytes(tokens.parts[tokens.data[i]]), encoding = 'utf-8')
-            if new_token.piece.startswith("[PAD") or new_token.piece.startswith("<dummy"):
-                break
-            vocab_list.append(new_token.piece)
             new_token.score = scores.parts[scores.data[i]]
             # llama.cpp tokentype is the same with sentencepiece token type
             new_token.type = int(types.parts[types.data[i]])
+            #if (new_token.piece.startswith("[PAD") or new_token.piece.startswith("<dummy")) and new_token.type == 4:
+       	    #   break
+            vocab_list.append(new_token.piece)
             vocab.pieces.append(new_token)
             if new_token.type == 3:
                 special_vocab[i] = {"content": new_token.piece, "special": True}
@@ -100,32 +100,38 @@ def convert_to_state_dict(checkpoint, save_dir):
         tokenizer_conf["added_tokens_decoder"] = special_vocab
     json.dump(tokenizer_conf, open(os.path.join(save_dir, "tokenizer_config.json"), 'w'), indent=2)
 
+
     # write config
     context_length = int(result.fields[f'{architecture}.context_length'].parts[-1])
     n_layer = int(result.fields[f'{architecture}.block_count'].parts[-1])
     n_head = int(result.fields[f'{architecture}.attention.head_count'].parts[-1])
-    n_local_heads = int(result.fields[f'{architecture}.attention.head_count_kv'].parts[-1])
     intermediate_size = int(result.fields[f'{architecture}.feed_forward_length'].parts[-1])
+    # qwen use ffn_size / 2 for ffn layers
+    if architecture == "qwen":
+        intermediate_size = intermediate_size / 2
     dim = int(result.fields[f'{architecture}.embedding_length'].parts[-1])
     # https://github.com/ggerganov/llama.cpp/blob/9731134296af3a6839cd682e51d9c2109a871de5/llama.cpp#L12301
-    if architecture in ["qwen2", "gemma", "qwen", "stablelm", "startcoder2"]:
+    if architecture in ["qwen2", "gemma", "qwen", "stablelm", "starcoder2", "phi2"]:
         rope_type = "neox"
     elif architecture in ["llama", "internlm2", "baichuan", "startcoder", "orion"]:
         rope_type = "norm"
     else:
         rope_type = "none"
 
-    if architecture in ["gemma"]:
-        hidden_act = "gelu"
-    elif architecture in ["starcoder2"]:
+    if architecture in ["starcoder2", "phi2"]:
         hidden_act = "gelu_tanh"
     else:
         hidden_act = "silu"
 
-    if architecture in ["starcoder2"]:
+    if architecture in ["starcoder2", "phi2"]:
         mlp_gate = False
     else:
         mlp_gate = True
+
+    if architecture in ["starcoder2", "phi2"]:
+        layernorm = True
+    else:
+        layernorm = False
     model_config= {
         "architecture": architecture,
         "block_size": context_length,
@@ -134,11 +140,13 @@ def convert_to_state_dict(checkpoint, save_dir):
         "n_head": n_head,
         "dim": dim,
         "intermediate_size": intermediate_size,
-        "n_local_heads": n_local_heads,
         "hidden_act": hidden_act,
         "rope_type": rope_type,
-        "mlp_gate": mlp_gate
+        "mlp_gate": mlp_gate,
+        "layernorm": layernorm
     }
+    if f'{architecture}.attention.head_count_kv' in result.fields:
+        model_config['n_local_heads'] = int(result.fields[f'{architecture}.attention.head_count_kv'].parts[-1])
     if f'{architecture}.attention.layer_norm_rms_epsilon' in result.fields:
         model_config['norm_eps'] = float(result.fields[f'{architecture}.attention.layer_norm_rms_epsilon'].parts[-1])
     if f'{architecture}.attention.key_length' in result.fields:
