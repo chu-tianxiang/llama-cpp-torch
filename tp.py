@@ -94,6 +94,8 @@ def _apply_tp_linear(linear: Linear, style: str) -> None:
     else:
         sharded_weight = shard(weight, 1)
         linear.infeatures = linear.infeatures // world_size
+        if linear.bias is not None:
+            linear.bias = linear.bias / world_size
     linear.weight = nn.Parameter(sharded_weight.contiguous().view(-1), requires_grad=False)
 
 
