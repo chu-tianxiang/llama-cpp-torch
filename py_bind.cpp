@@ -22,7 +22,7 @@ torch::Tensor ggml_mul_mat_vec_a8(
     int64_t row
 );
 
-torch::Tensor void ggml_mul_mat_a8(
+torch::Tensor ggml_mul_mat_a8(
     torch::Tensor W,  // quant weight
     torch::Tensor X,  // input
     int8_t type,
