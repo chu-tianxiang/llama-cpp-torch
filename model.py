@@ -4,6 +4,7 @@
 
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
+import math
 import os
 import json
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ class ModelArgs:
     head_dim: int = -1
     rope_base: float = 10000
     rope_type: str = "none"
+    rope_dim: int = -1
     norm_eps: float = 1e-5
     moe: bool = False
     num_experts: int = 1
@@ -42,6 +44,7 @@ class ModelArgs:
     hidden_act: str = "silu"
     mlp_gate: bool = True
     layernorm: bool = False
+    logit_scale: float = 1.0
 
     def __post_init__(self):
         if self.n_local_heads == -1:
@@ -52,6 +55,8 @@ class ModelArgs:
             self.intermediate_size = find_multiple(n_hidden, 256)
         if self.head_dim == -1:
             self.head_dim = self.dim // self.n_head
+        if self.rope_dim == -1:
+            self.rope_dim = self.head_dim
 
 
 class KVCache(nn.Module):
@@ -94,14 +99,14 @@ class Transformer(nn.Module):
     def setup_caches(self, max_batch_size, max_seq_length):
         if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
             return
-        head_dim = self.config.dim // self.config.n_head
+        head_dim = self.config.head_dim
         max_seq_length = find_multiple(max_seq_length, 8)
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
         for b in self.blk:
             b.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim)
 
-        self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base)
+        self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.rope_dim, self.config.rope_base)
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
 
     def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
@@ -109,13 +114,18 @@ class Transformer(nn.Module):
         mask = self.causal_mask[None, None, input_pos]
         freqs_cis = self.freqs_cis[input_pos]
         x = self.token_embd(idx)
-        # if self.config.architecture == "gemma":
-        #     x = x * (self.config.dim ** 0.5)
+        if self.config.architecture == "gemma":
+            x = x * (self.config.dim ** 0.5)
+        if self.config.architecture == "minicpm":
+            x = x * 12.0
 
         for i, layer in enumerate(self.blk):
             x = layer(x, input_pos, freqs_cis, mask)
         x = self.output_norm(x)
         logits = self.output(x)
+        if self.config.architecture == "minicpm":
+            logits = logits / (self.config.dim // 256)
+        logits *= self.config.logit_scale
         return logits
 
     @classmethod
@@ -145,7 +155,7 @@ class TransformerBlock(nn.Module):
             self.attn_q = Linear(config.dim, config.n_head * config.head_dim, bias=True)
             self.attn_k = Linear(config.dim, config.n_local_heads * config.head_dim, bias=True)
             self.attn_v = Linear(config.dim, config.n_local_heads * config.head_dim, bias=True)
-        self.attn_output = Linear(config.dim, config.dim, bias=True)
+        self.attn_output = Linear(config.n_head * config.head_dim, config.dim, bias=True)
         self.kv_cache = None
 
         # ffn norm
@@ -180,6 +190,7 @@ class TransformerBlock(nn.Module):
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
         self.rope_type = config.rope_type
+        self.rope_dim = config.rope_dim
         self.world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
 
     def forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor) -> Tensor:
@@ -196,8 +207,16 @@ class TransformerBlock(nn.Module):
             k = self.attn_k(attn_x).view(bsz, seqlen, self.n_local_heads, self.head_dim)
             v = self.attn_v(attn_x).view(bsz, seqlen, self.n_local_heads, self.head_dim)
 
-        q = apply_rotary_emb(q, freqs_cis, self.rope_type)
-        k = apply_rotary_emb(k, freqs_cis, self.rope_type)
+        if self.rope_dim != self.head_dim:
+            q_rot, q_pass = q[..., :self.rope_dim], q[..., self.rope_dim:]
+            k_rot, k_pass = k[..., :self.rope_dim], k[..., self.rope_dim:]
+            q_rot = apply_rotary_emb(q_rot, freqs_cis, self.rope_type)
+            k_rot = apply_rotary_emb(k_rot, freqs_cis, self.rope_type)
+            q = torch.cat((q_rot, q_pass), dim=-1)
+            k = torch.cat((k_rot, k_pass), dim=-1)
+        else:
+            q = apply_rotary_emb(q, freqs_cis, self.rope_type)
+            k = apply_rotary_emb(k, freqs_cis, self.rope_type)
 
         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
 
@@ -207,15 +226,18 @@ class TransformerBlock(nn.Module):
         k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
-        y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
+        y = y.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         y = self.attn_output(y)
 
         if self.world_size > 1:
             y = funcol.all_reduce(y, "sum", list(range(self.world_size)))
 
+        if self.config.architecture == "minicpm":
+            y = y * 1.4 / math.sqrt(self.config.n_layer)
+
         y = x + y
 
-        if self.config.architecture == "phi2":
+        if self.config.architecture in ["phi2", "command-r"]:
             mlp_y = attn_x
         else:
             mlp_y = self.ffn_norm(y)
@@ -247,6 +269,8 @@ class TransformerBlock(nn.Module):
         if self.world_size > 1:
             z = funcol.all_reduce(z, "sum", list(range(self.world_size)))
 
+        if self.config.architecture == "minicpm":
+            z = z * 1.4 / math.sqrt(self.config.n_layer)
         z = z + y
 
         return z

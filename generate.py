@@ -6,16 +6,19 @@
 # LICENSE file in the root directory of this source tree.
 import json
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Tuple
 
+import jinja2
 import torch
 import torch._dynamo.config
 import torch._inductor.config
 import torch.distributed as dist
+from jinja2.sandbox import ImmutableSandboxedEnvironment
 from sentencepiece import SentencePieceProcessor
-from gpt2_tokenizer import GPT2Tokenizer
 
+from gpt2_tokenizer import GPT2Tokenizer
 from model import Transformer
 from tp import maybe_init_dist, _get_world_size
 
@@ -29,6 +32,17 @@ def device_sync(device):
         pass
     else:
         print(f"device={device} is not yet suppported")
+
+@lru_cache
+def get_template(chat_template):
+    jinja_env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
+    return jinja_env.from_string(chat_template)
+
+def apply_template(chat_template, query):
+    compiled_template = get_template(chat_template)
+    chat = [{"role": "user", "content": query}]
+    rendered_chat = compiled_template.render(messages=chat, add_generation_prompt=True)
+    return rendered_chat
 
 def multinomial_sample_one_no_sync(probs_sort): # Does multinomial sampling without a cuda synchronization
     q = torch.empty_like(probs_sort).exponential_(1)
@@ -69,7 +83,9 @@ def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torc
             )
             input_pos += 1
             new_tokens.append(next_token.clone())
-            callback(new_tokens[-1])
+            status = callback(new_tokens[-1])
+            if not status:
+                break
             new_probs.append(next_prob.clone())
             cur_token = next_token.view(1, -1)
 
@@ -118,9 +134,9 @@ def generate(
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
 
     generated_tokens, _ = decode_n_tokens(model, next_token.view(1, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
-    seq[T + 1:] = torch.cat(generated_tokens)
+    seq[T + 1: T + 1 + len(generated_tokens)] = torch.cat(generated_tokens)
 
-    return seq
+    return seq[:T + 1 + len(generated_tokens)]
 
 
 def encode_tokens(tokenizer, special_tokens, string, bos=True, device='cuda'):
@@ -197,11 +213,8 @@ def main(
                           checkpoint_path / "merges.txt",
                           checkpoint_path / "tokenizer_config.json")
 
-    B_INST, E_INST = "[INST]", "[/INST]"
-    arch = json.load(open(checkpoint_path / "config.json"))["architecture"]
-
-    if arch in ["qwen2", "internlm2"]:
-        B_INST, E_INST = "<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n"
+    tokenizer_config = json.load(open(checkpoint_path / "tokenizer_config.json"))
+    chat_template = tokenizer_config["chat_template"] if "chat_template" in tokenizer_config else None
 
     global print
     rank = maybe_init_dist()
@@ -212,7 +225,6 @@ def main(
             print = lambda *args, **kwargs: None
 
     precision = torch.float16
-    is_chat = "chat" in str(checkpoint_path).lower()
 
     print("Loading model ...")
     t0 = time.time()
@@ -258,25 +270,33 @@ def main(
                 dist.all_gather_object(prompt_list, prompt)
                 prompt = prompt_list[0]
 
-            if is_chat:
-                prompt = f"{B_INST} {prompt.strip()} {E_INST}"
+            if chat_template is not None:
+                prompt = apply_template(chat_template, prompt)
             encoded = encode_tokens(tokenizer, special_tokens, prompt.strip(),
                                     bos=tokenizer_conf.get("add_bos_token", False), device=device)
 
         if interactive and i >= 0:
             buffer = []
-            period_id = tokenizer.encode('.')[0]
+            token_buffer = []
+            period_id = tokenizer.encode('.')[-1]
             done_generating = False
             def callback(x):
-                nonlocal done_generating
+                nonlocal done_generating, token_buffer
                 if done_generating:
-                    return
-                buffer.append(tokenizer.decode([period_id] + x.tolist())[1:])
+                    return False
+                token_buffer.extend(x.tolist())
+                token = tokenizer.decode([period_id] + token_buffer)[1:]
+                if token.endswith("�"):
+                    return True
+                else:
+                    buffer.append(token)
+                    token_buffer = []
                 if x.item() == tokenizer.eos_id():
                     done_generating = True
                 if len(buffer) == 4 or done_generating:
                     print(''.join(buffer), end='', flush=True)
                     buffer.clear()
+                return True
         else:
             callback = lambda x : x
         t0 = time.perf_counter()

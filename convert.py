@@ -13,7 +13,8 @@ def convert_to_state_dict(checkpoint, save_dir):
     result = GGUFReader(checkpoint)
     architecture = result.fields['general.architecture']
     architecture = str(bytes(architecture.parts[architecture.data[0]]), encoding = 'utf-8')
-    if architecture not in ["llama", "qwen2", "internlm2", "starcoder2", "qwen"]:
+    if architecture not in ["llama", "qwen2", "internlm2", "starcoder2", "qwen",
+                            "stablelm", "orion", "minicpm", "gemma", "xverse", "command-r"]:
         print(f"Unsupported architecture {architecture}")
         return
     # write tensor
@@ -62,24 +63,38 @@ def convert_to_state_dict(checkpoint, save_dir):
         # model_type = BPE
         vocab.trainer_spec.model_type = 2
         vocab.trainer_spec.vocab_size = vocab_size
-        vocab.trainer_spec.byte_fallback = True
+        if architecture not in ['orion']:
+            vocab.trainer_spec.byte_fallback = True
         vocab.normalizer_spec.remove_extra_whitespaces = False
         tokens = result.fields['tokenizer.ggml.tokens']
-        scores = result.fields['tokenizer.ggml.scores']
+        if 'tokenizer.ggml.scores' in result.fields:
+            scores = result.fields['tokenizer.ggml.scores']
+        else:
+            scores = None
         types = result.fields['tokenizer.ggml.token_type']
         special_vocab = {}
+        has_unk = False
         for i in range(vocab_size):
             new_token = vocab.SentencePiece()
             new_token.piece = str(bytes(tokens.parts[tokens.data[i]]), encoding = 'utf-8')
-            new_token.score = scores.parts[scores.data[i]]
+            if scores:
+                new_token.score = scores.parts[scores.data[i]]
             # llama.cpp tokentype is the same with sentencepiece token type
             new_token.type = int(types.parts[types.data[i]])
-            #if (new_token.piece.startswith("[PAD") or new_token.piece.startswith("<dummy")) and new_token.type == 4:
-       	    #   break
+            if new_token.type == 2:
+                has_unk = True
+            # fix for xverse, is it correct?
+            if new_token.piece == r"<b'\x00'>":
+                new_token.piece = rb'\x00'
+                new_token.type = 1
             vocab_list.append(new_token.piece)
             vocab.pieces.append(new_token)
             if new_token.type == 3:
                 special_vocab[i] = {"content": new_token.piece, "special": True}
+        # hf_vocab doesn't correctly set unk token type, so we force one
+        if not has_unk:
+            vocab.pieces[0].type = 2
+
         with open(os.path.join(save_dir, "tokenizer.model"), 'wb') as f:
             f.write(vocab.SerializeToString())
 
@@ -96,6 +111,8 @@ def convert_to_state_dict(checkpoint, save_dir):
         tokenizer_conf["add_bos_token"] = bool(result.fields['tokenizer.ggml.add_bos_token'].parts[-1])
     if 'tokenizer.ggml.add_eos_token' in result.fields:
         tokenizer_conf["add_eos_token"] = bool(result.fields['tokenizer.ggml.add_eos_token'].parts[-1])
+    if 'tokenizer.chat_template' in result.fields:
+        tokenizer_conf['chat_template'] = str(bytes(result.fields['tokenizer.chat_template'].parts[-1]), encoding = 'utf-8')
     if special_vocab:
         tokenizer_conf["added_tokens_decoder"] = special_vocab
     json.dump(tokenizer_conf, open(os.path.join(save_dir, "tokenizer_config.json"), 'w'), indent=2)
@@ -110,15 +127,20 @@ def convert_to_state_dict(checkpoint, save_dir):
     if architecture == "qwen":
         intermediate_size = intermediate_size / 2
     dim = int(result.fields[f'{architecture}.embedding_length'].parts[-1])
+    if f'{architecture}.logit_scale' in result.fields:
+        logit_scale = float(result.fields[f'{architecture}.logit_scale'].parts[-1])
+    else:
+        logit_scale = 1.0
     # https://github.com/ggerganov/llama.cpp/blob/9731134296af3a6839cd682e51d9c2109a871de5/llama.cpp#L12301
     if architecture in ["qwen2", "gemma", "qwen", "stablelm", "starcoder2", "phi2"]:
         rope_type = "neox"
-    elif architecture in ["llama", "internlm2", "baichuan", "startcoder", "orion"]:
+    elif architecture in ["llama", "internlm2", "baichuan", "startcoder", "orion", "minicpm",
+                          "xverse", "command-r"]:
         rope_type = "norm"
     else:
         rope_type = "none"
 
-    if architecture in ["starcoder2", "phi2"]:
+    if architecture in ["starcoder2", "phi2", "gemma"]:
         hidden_act = "gelu_tanh"
     else:
         hidden_act = "silu"
@@ -128,7 +150,7 @@ def convert_to_state_dict(checkpoint, save_dir):
     else:
         mlp_gate = True
 
-    if architecture in ["starcoder2", "phi2"]:
+    if architecture in ["starcoder2", "phi2", "stablelm", "orion", "command-r"]:
         layernorm = True
     else:
         layernorm = False
@@ -143,7 +165,8 @@ def convert_to_state_dict(checkpoint, save_dir):
         "hidden_act": hidden_act,
         "rope_type": rope_type,
         "mlp_gate": mlp_gate,
-        "layernorm": layernorm
+        "layernorm": layernorm,
+        "logit_scale": logit_scale
     }
     if f'{architecture}.attention.head_count_kv' in result.fields:
         model_config['n_local_heads'] = int(result.fields[f'{architecture}.attention.head_count_kv'].parts[-1])
@@ -153,6 +176,8 @@ def convert_to_state_dict(checkpoint, save_dir):
         model_config['head_dim'] = int(result.fields[f'{architecture}.attention.key_length'].parts[-1])
     if f'{architecture}.rope.freq_base' in result.fields:
         model_config['rope_base'] = float(result.fields[f'{architecture}.rope.freq_base'].parts[-1])
+    if f'{architecture}.rope_dimension_count' in result.fields:
+        model_config['rope_dim'] = int(result.fields[f'{architecture}.rope_dimension_count'].parts[-1])
     if f'{architecture}.expert_count' in result.fields:
         model_config['num_experts'] = int(result.fields[f'{architecture}.expert_count'].parts[-1])
         model_config['num_experts_per_tok'] = int(result.fields[f'{architecture}.expert_used_count'].parts[-1])

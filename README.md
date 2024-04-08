@@ -9,6 +9,12 @@ This repo provides an example for converting GGUF files back into PyTorch state 
 * Qwen / Qwen2
 * InternLM2
 * StarCoder2
+* Orion
+* MiniCPM
+* Xverse
+* Command-r-v01
+* StableLM
+* Gemma
 
 The code is largely inspired by the original [`llama.cpp`](https://github.com/ggerganov/llama.cpp) and [`GPT-Fast`](https://github.com/pytorch-labs/gpt-fast).
 
@@ -37,4 +43,5 @@ python generate.py --checkpoint_path TinyLlama-Q4_K_M --interactive --compile
 
 ## Todo
 * Add support to more model
-* Optimize Mixtral performace
+* Support partitioned model
+* Support new MoE breaking change

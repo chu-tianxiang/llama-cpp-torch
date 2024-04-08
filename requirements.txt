@@ -1,3 +1,4 @@
 gguf
+jinja2
 torch
 sentencepiece
